@@ -1,0 +1,27 @@
+# Core dependencies
+cryptography>=41.0.0
+pynacl>=1.5.0
+msgpack>=1.0.7
+aiofiles>=23.2.1
+
+# Networking
+asyncio-throttle>=1.0.1
+
+# Database
+aiosqlite>=0.19.0
+
+# CLI
+click>=8.1.7
+rich>=13.7.0
+
+# Logging
+structlog>=23.2.0
+
+# Testing
+pytest>=7.4.3
+pytest-asyncio>=0.21.1
+pytest-cov>=4.1.0
+
+# Optional: Rust bindings for performance
+# These can be installed separately if needed
+# pyo3>=0.20.0
