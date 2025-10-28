@@ -11,6 +11,7 @@ from positron_networking.peers import PeerManager
 from positron_networking.gossip import GossipProtocol
 from positron_networking.network import NetworkTransport
 from positron_networking.protocol import Message, MessageType, MessageFactory, PeerInfo
+from positron_networking.dht import DistributedHashTable
 import structlog
 import time
 
@@ -38,6 +39,7 @@ class Node:
         self.peer_manager: Optional[PeerManager] = None
         self.gossip: Optional[GossipProtocol] = None
         self.network: Optional[NetworkTransport] = None
+        self.dht: Optional[DistributedHashTable] = None
         
         # Custom message handlers
         self._custom_handlers = {}
@@ -110,6 +112,17 @@ class Node:
         self._register_handlers()
         await self.gossip.start()
         
+        # Initialize DHT
+        self.dht = DistributedHashTable(
+            node_id=self.identity.node_id,
+            address=self.address,
+            k=20,  # Standard Kademlia bucket size
+            alpha=3,  # Concurrency parameter
+            replication_factor=self.config.dht_replication_factor if hasattr(self.config, 'dht_replication_factor') else 3,
+            ttl_default=self.config.dht_ttl_default if hasattr(self.config, 'dht_ttl_default') else 3600.0
+        )
+        await self.dht.start()
+        
         # Initialize network transport
         self.network = NetworkTransport(
             identity=self.identity,
@@ -150,6 +163,9 @@ class Node:
         # Stop components in reverse order
         if self.network:
             await self.network.stop()
+        
+        if self.dht:
+            await self.dht.stop()
         
         if self.gossip:
             await self.gossip.stop()
@@ -408,12 +424,83 @@ class Node:
             self.identity.node_id,
             trusted_peers[:20]
         )
-        
         await self.gossip.broadcast(message)
+    
+    # DHT Methods
+    
+    async def dht_store(self, key: str, value: Any, ttl: Optional[float] = None) -> bool:
+        """
+        Store a key-value pair in the distributed hash table.
+        
+        Args:
+            key: Storage key
+            value: Value to store
+            ttl: Time-to-live in seconds (None = use default)
+            
+        Returns:
+            True if stored successfully
+        """
+        if not self.dht:
+            raise RuntimeError("DHT not initialized")
+        
+        return await self.dht.store(key, value, ttl=ttl, replicate=True)
+    
+    async def dht_retrieve(self, key: str) -> Optional[Any]:
+        """
+        Retrieve a value from the distributed hash table.
+        
+        Args:
+            key: Storage key
+            
+        Returns:
+            Retrieved value or None if not found
+        """
+        if not self.dht:
+            raise RuntimeError("DHT not initialized")
+        
+        return await self.dht.retrieve(key, local_only=False)
+    
+    async def dht_delete(self, key: str) -> bool:
+        """
+        Delete a key-value pair from the distributed hash table.
+        
+        Args:
+            key: Key to delete
+            
+        Returns:
+            True if deleted
+        """
+        if not self.dht:
+            raise RuntimeError("DHT not initialized")
+        
+        return await self.dht.delete(key, replicate=True)
+    
+    def dht_get_stats(self) -> dict:
+        """
+        Get DHT statistics.
+        
+        Returns:
+            Dictionary of DHT statistics
+        """
+        if not self.dht:
+            return {}
+        
+        return self.dht.get_statistics()
+    
+    async def dht_add_peer(self, node_id: str, address: str):
+        """
+        Add a peer to the DHT routing table.
+        
+        Args:
+            node_id: Node identifier
+            address: Node network address
+        """
+        if self.dht:
+            self.dht.add_node(node_id, address)
     
     def get_stats(self) -> dict:
         """Get node statistics."""
-        return {
+        stats = {
             "node_id": self.identity.node_id,
             "address": self.address,
             "active_peers": len(self.peer_manager.active_peers),
@@ -421,3 +508,8 @@ class Node:
             "connections": self.network.get_connection_count(),
             "gossip_stats": self.gossip.get_statistics(),
         }
+        
+        if self.dht:
+            stats["dht_stats"] = self.dht.get_statistics()
+        
+        return stats

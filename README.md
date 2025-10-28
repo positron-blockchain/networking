@@ -57,6 +57,11 @@ A production-ready decentralized peer-to-peer network implementation in Python w
 - **Configurable Limits**: Control resource usage and performance
 - **Timeout Management**: Handle network failures gracefully
 
+### 🎯 Advanced Features ✨ NEW
+- **Bloom Filters**: Space-efficient probabilistic data structures for message deduplication with configurable false positive rates
+- **Distributed Hash Table (DHT)**: Kademlia-inspired distributed key-value storage with automatic replication and fault tolerance
+- **Enhanced Metrics**: Comprehensive monitoring with counters, gauges, histograms, and Prometheus export support
+
 ## Architecture
 
 ```
@@ -239,6 +244,94 @@ await node.request_trusted_peers("peer_node_id")
 
 # Share your trusted peers with the network
 await node.share_trusted_peers()
+```
+
+### Use Distributed Hash Table (DHT) ✨ NEW
+
+```python
+# Store a value in the DHT
+await node.dht_store("my_key", {"data": "value"}, ttl=3600)
+
+# Retrieve a value from the DHT
+value = await node.dht_retrieve("my_key")
+print(f"Retrieved: {value}")
+
+# Delete a value from the DHT
+await node.dht_delete("my_key")
+
+# Get DHT statistics
+dht_stats = node.dht_get_stats()
+print(f"Stored keys: {dht_stats['stored_keys']}")
+print(f"Total nodes in routing table: {dht_stats['total_nodes']}")
+```
+
+### Use Bloom Filters ✨ NEW
+
+```python
+from positron_networking.bloom_filter import BloomFilter, ScalableBloomFilter
+
+# Create a Bloom filter
+bloom = BloomFilter(expected_elements=10000, false_positive_rate=0.01)
+
+# Add items
+bloom.add("message_id_1")
+bloom.add("message_id_2")
+
+# Check membership
+if "message_id_1" in bloom:
+    print("Message may have been seen before")
+
+# Get statistics
+stats = bloom.get_stats()
+print(f"Current false positive rate: {stats['current_false_positive_rate']}")
+
+# Serialize and deserialize
+serialized = bloom.serialize()
+restored = BloomFilter.deserialize(serialized)
+
+# Use scalable Bloom filter for dynamic growth
+scalable_bloom = ScalableBloomFilter(initial_capacity=1000)
+for i in range(10000):  # Automatically scales
+    scalable_bloom.add(f"item_{i}")
+```
+
+### Enhanced Metrics System ✨ NEW
+
+```python
+from positron_networking.metrics import get_metrics
+
+# Get the global metrics collector
+metrics = get_metrics()
+
+# Increment counters
+metrics.increment_counter("messages.sent.total")
+metrics.increment_counter("messages.received.total", 5)
+
+# Set gauge values
+metrics.set_gauge("connections.active", 10)
+metrics.set_gauge("peers.active", 25)
+
+# Record histogram values
+metrics.observe_histogram("message.size.bytes", 1024)
+metrics.observe_histogram("message.latency.seconds", 0.05)
+
+# Use timer context manager
+with metrics.timer("operation.duration.seconds"):
+    # Your code here
+    await some_operation()
+
+# Get all metrics
+all_metrics = metrics.get_all_metrics()
+print(all_metrics)
+
+# Get summary
+summary = metrics.get_summary()
+print(f"Messages sent: {summary['messages']['sent']}")
+print(f"Active peers: {summary['peers']['active']}")
+
+# Export in Prometheus format
+prometheus_output = metrics.export_prometheus()
+print(prometheus_output)
 ```
 
 ## Testing
@@ -472,17 +565,17 @@ MIT License - See LICENSE file for details
 
 ## Roadmap
 
-- [ ] Integration with existing Node/Gossip/Peers modules
-- [ ] Comprehensive transport layer tests
-- [ ] DHT implementation for distributed key-value storage
+- [x] Integration with existing Node/Gossip/Peers modules
+- [x] Comprehensive transport layer tests
+- [x] **Bloom filters for efficient anti-entropy** ✨ NEW
+- [x] **DHT implementation for distributed key-value storage** ✨ NEW
+- [x] **Enhanced metrics and monitoring dashboard** ✨ NEW
 - [ ] NAT traversal and hole punching
 - [ ] QUIC transport support
-- [ ] Bloom filters for efficient anti-entropy
 - [ ] Rust extensions for performance-critical paths (C/C++/Cython support)
 - [ ] WebRTC support for browser nodes
 - [ ] Enhanced Byzantine fault tolerance
 - [ ] Network visualization tools
-- [ ] Metrics and monitoring dashboard
 
 ## Related Projects
 

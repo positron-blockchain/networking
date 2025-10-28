@@ -7,6 +7,7 @@ from positron_networking.protocol import Message, MessageType, MessageFactory
 from positron_networking.peers import PeerManager
 from positron_networking.storage import Storage
 from positron_networking.trust import TrustManager
+from positron_networking.bloom_filter import ScalableBloomFilter
 import time
 import random
 from collections import deque
@@ -23,7 +24,8 @@ class GossipProtocol:
         trust_manager: TrustManager,
         fanout: int = 3,
         gossip_interval: float = 1.0,
-        message_cache_size: int = 10000
+        message_cache_size: int = 10000,
+        use_bloom_filter: bool = True
     ):
         """
         Initialize gossip protocol.
@@ -36,6 +38,7 @@ class GossipProtocol:
             fanout: Number of peers to gossip to per round
             gossip_interval: Interval between gossip rounds
             message_cache_size: Maximum number of message IDs to cache
+            use_bloom_filter: Use Bloom filter for efficient deduplication (default: True)
         """
         self.node_id = node_id
         self.peer_manager = peer_manager
@@ -43,10 +46,23 @@ class GossipProtocol:
         self.trust_manager = trust_manager
         self.fanout = fanout
         self.gossip_interval = gossip_interval
+        self.use_bloom_filter = use_bloom_filter
         
-        # Message cache for deduplication (using deque for FIFO)
-        self.message_cache: deque = deque(maxlen=message_cache_size)
-        self.message_cache_set: Set[str] = set()
+        # Message cache for deduplication
+        if use_bloom_filter:
+            # Use scalable Bloom filter for space-efficient deduplication
+            self.bloom_filter = ScalableBloomFilter(
+                initial_capacity=message_cache_size,
+                false_positive_rate=0.001  # 0.1% false positive rate
+            )
+            # Keep a smaller exact cache for recent messages to eliminate false positives
+            self.recent_cache: deque = deque(maxlen=1000)
+            self.recent_cache_set: Set[str] = set()
+        else:
+            # Fall back to traditional set-based cache
+            self.bloom_filter = None
+            self.message_cache: deque = deque(maxlen=message_cache_size)
+            self.message_cache_set: Set[str] = set()
         
         # Pending messages to gossip
         self.pending_messages: deque = deque()
@@ -226,18 +242,32 @@ class GossipProtocol:
         """
         Check if we've seen a message before.
         
+        Uses Bloom filter for space-efficient membership testing if enabled.
+        
         Args:
             message_id: Message identifier
             
         Returns:
             True if message has been seen
         """
-        # Check in-memory cache first
-        if message_id in self.message_cache_set:
-            return True
-        
-        # Check persistent storage
-        return await self.storage.has_seen_message(message_id)
+        if self.use_bloom_filter:
+            # Check recent exact cache first (eliminates false positives)
+            if message_id in self.recent_cache_set:
+                return True
+            
+            # Check Bloom filter (may have false positives)
+            if message_id in self.bloom_filter:
+                # Possible match - verify in persistent storage
+                return await self.storage.has_seen_message(message_id)
+            
+            return False
+        else:
+            # Traditional set-based check
+            if message_id in self.message_cache_set:
+                return True
+            
+            # Check persistent storage
+            return await self.storage.has_seen_message(message_id)
     
     async def _mark_seen(self, message_id: str):
         """
@@ -246,15 +276,29 @@ class GossipProtocol:
         Args:
             message_id: Message identifier
         """
-        # Add to in-memory cache
-        if message_id not in self.message_cache_set:
-            if len(self.message_cache) >= self.message_cache.maxlen:
-                # Remove oldest from set
-                oldest = self.message_cache[0]
-                self.message_cache_set.discard(oldest)
+        if self.use_bloom_filter:
+            # Add to Bloom filter
+            self.bloom_filter.add(message_id)
             
-            self.message_cache.append(message_id)
-            self.message_cache_set.add(message_id)
+            # Add to recent exact cache
+            if message_id not in self.recent_cache_set:
+                if len(self.recent_cache) >= self.recent_cache.maxlen:
+                    # Remove oldest from set
+                    oldest = self.recent_cache[0]
+                    self.recent_cache_set.discard(oldest)
+                
+                self.recent_cache.append(message_id)
+                self.recent_cache_set.add(message_id)
+        else:
+            # Traditional set-based marking
+            if message_id not in self.message_cache_set:
+                if len(self.message_cache) >= self.message_cache.maxlen:
+                    # Remove oldest from set
+                    oldest = self.message_cache[0]
+                    self.message_cache_set.discard(oldest)
+                
+                self.message_cache.append(message_id)
+                self.message_cache_set.add(message_id)
         
         # Persist to storage
         await self.storage.mark_message_seen(message_id, self.node_id)
@@ -286,11 +330,18 @@ class GossipProtocol:
         Returns:
             Dictionary of statistics
         """
-        return {
+        stats = {
             **self.stats,
             "pending_messages": len(self.pending_messages),
-            "message_cache_size": len(self.message_cache),
         }
+        
+        if self.use_bloom_filter:
+            stats["bloom_filter"] = self.bloom_filter.get_stats()
+            stats["recent_cache_size"] = len(self.recent_cache)
+        else:
+            stats["message_cache_size"] = len(self.message_cache)
+        
+        return stats
     
     async def request_anti_entropy(self, peer_node_id: str):
         """
