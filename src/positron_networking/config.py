@@ -13,8 +13,8 @@ class NetworkConfig:
     
     # Node identity
     node_id: Optional[str] = None
-    private_key_path: str = "keys/private_key.pem"
-    public_key_path: str = "keys/public_key.pem"
+    private_key_path: Optional[str] = None
+    public_key_path: Optional[str] = None
     
     # Network settings
     host: str = "0.0.0.0"
@@ -45,7 +45,7 @@ class NetworkConfig:
     
     # Storage
     data_dir: str = "node_data"
-    db_path: str = "node_data/network.db"
+    db_path: Optional[str] = None
     
     # Logging
     log_level: str = "INFO"
@@ -57,7 +57,16 @@ class NetworkConfig:
     connection_timeout: float = 10.0
     
     def __post_init__(self):
-        """Ensure data directories exist."""
+        """Ensure data directories exist and set default paths."""
+        # Set default paths relative to data_dir if not specified
+        if self.private_key_path is None:
+            self.private_key_path = os.path.join(self.data_dir, "keys", "private_key.pem")
+        if self.public_key_path is None:
+            self.public_key_path = os.path.join(self.data_dir, "keys", "public_key.pem")
+        if self.db_path is None:
+            self.db_path = os.path.join(self.data_dir, "network.db")
+        
+        # Create directories
         os.makedirs(os.path.dirname(self.private_key_path), exist_ok=True)
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
