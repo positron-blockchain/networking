@@ -22,6 +22,10 @@ class MessageType(IntEnum):
     TRUSTED_PEERS_RESPONSE = 9
     DISCONNECT = 10
     CUSTOM_DATA = 11
+    # NAT Traversal messages
+    NAT_CANDIDATE_OFFER = 12
+    NAT_CANDIDATE_ANSWER = 13
+    NAT_PUNCH_REQUEST = 14
 
 
 @dataclass
@@ -258,3 +262,43 @@ class MessageFactory:
             payload={"data": data},
             ttl=ttl
         )
+    
+    @staticmethod
+    def create_nat_candidate_offer(
+        sender_id: str,
+        candidates: List[Dict[str, Any]]
+    ) -> Message:
+        """Create a NAT candidate offer message."""
+        return Message(
+            msg_type=MessageType.NAT_CANDIDATE_OFFER,
+            sender_id=sender_id,
+            timestamp=time.time(),
+            payload={"candidates": candidates}
+        )
+    
+    @staticmethod
+    def create_nat_candidate_answer(
+        sender_id: str,
+        candidates: List[Dict[str, Any]]
+    ) -> Message:
+        """Create a NAT candidate answer message."""
+        return Message(
+            msg_type=MessageType.NAT_CANDIDATE_ANSWER,
+            sender_id=sender_id,
+            timestamp=time.time(),
+            payload={"candidates": candidates}
+        )
+    
+    @staticmethod
+    def create_nat_punch_request(
+        sender_id: str,
+        punch_id: str
+    ) -> Message:
+        """Create a NAT punch request message."""
+        return Message(
+            msg_type=MessageType.NAT_PUNCH_REQUEST,
+            sender_id=sender_id,
+            timestamp=time.time(),
+            payload={"punch_id": punch_id}
+        )
+

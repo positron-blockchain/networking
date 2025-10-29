@@ -12,6 +12,7 @@ from positron_networking.gossip import GossipProtocol
 from positron_networking.network import NetworkTransport
 from positron_networking.protocol import Message, MessageType, MessageFactory, PeerInfo
 from positron_networking.dht import DistributedHashTable
+from positron_networking.nat_traversal import NATTraversalManager
 import structlog
 import time
 
@@ -40,6 +41,7 @@ class Node:
         self.gossip: Optional[GossipProtocol] = None
         self.network: Optional[NetworkTransport] = None
         self.dht: Optional[DistributedHashTable] = None
+        self.nat_traversal: Optional[NATTraversalManager] = None
         
         # Custom message handlers
         self._custom_handlers = {}
@@ -134,6 +136,22 @@ class Node:
         self.network.set_message_handler(self._handle_network_message)
         await self.network.start()
         
+        # Initialize NAT traversal
+        self.nat_traversal = NATTraversalManager(
+            local_port=self.config.port,
+            stun_servers=[
+                ("stun.l.google.com", 19302),
+                ("stun1.l.google.com", 19302),
+                ("stun2.l.google.com", 19302)
+            ]
+        )
+        await self.nat_traversal.initialize()
+        self.logger.info(
+            "NAT traversal initialized",
+            behind_nat=self.nat_traversal.is_behind_nat(),
+            nat_type=self.nat_traversal.get_nat_info().get("nat_type") if self.nat_traversal.is_behind_nat() else None
+        )
+        
         # Start background tasks
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         
@@ -161,6 +179,9 @@ class Node:
                 pass
         
         # Stop components in reverse order
+        if self.nat_traversal:
+            await self.nat_traversal.stop()
+        
         if self.network:
             await self.network.stop()
         
@@ -198,6 +219,18 @@ class Node:
         self.gossip.register_handler(
             MessageType.PEER_DISCOVERY,
             self._handle_peer_discovery
+        )
+        self.gossip.register_handler(
+            MessageType.NAT_CANDIDATE_OFFER,
+            self._handle_nat_candidate_offer
+        )
+        self.gossip.register_handler(
+            MessageType.NAT_CANDIDATE_ANSWER,
+            self._handle_nat_candidate_answer
+        )
+        self.gossip.register_handler(
+            MessageType.NAT_PUNCH_REQUEST,
+            self._handle_nat_punch_request
         )
         self.gossip.register_handler(
             MessageType.PEER_ANNOUNCEMENT,
@@ -337,6 +370,72 @@ class Node:
                 await handler(message.sender_id, data)
             except Exception as e:
                 self.logger.error(f"Error in custom handler: {e}")
+    
+    async def _handle_nat_candidate_offer(self, message: Message, sender_address: str):
+        """Handle NAT candidate offer from a peer."""
+        if not self.nat_traversal:
+            return
+        
+        candidates = message.payload.get("candidates", [])
+        self.logger.info(
+            "received_nat_candidates",
+            peer_id=message.sender_id,
+            count=len(candidates)
+        )
+        
+        # Get our own candidates
+        our_candidates = await self.nat_traversal.get_candidates()
+        
+        # Send our candidates back
+        answer = MessageFactory.create_nat_candidate_answer(
+            self.identity.node_id,
+            our_candidates
+        )
+        await self.network.send_to_peer(message.sender_id, answer)
+        
+        # Attempt to connect using received candidates
+        try:
+            success = await self.nat_traversal.connect_to_peer(
+                message.sender_id,
+                candidates
+            )
+            if success:
+                self.logger.info("nat_connection_established", peer_id=message.sender_id)
+        except Exception as e:
+            self.logger.warning("nat_connection_failed", peer_id=message.sender_id, error=str(e))
+    
+    async def _handle_nat_candidate_answer(self, message: Message, sender_address: str):
+        """Handle NAT candidate answer from a peer."""
+        if not self.nat_traversal:
+            return
+        
+        candidates = message.payload.get("candidates", [])
+        self.logger.info(
+            "received_nat_answer",
+            peer_id=message.sender_id,
+            count=len(candidates)
+        )
+        
+        # Attempt to connect using received candidates
+        try:
+            success = await self.nat_traversal.connect_to_peer(
+                message.sender_id,
+                candidates
+            )
+            if success:
+                self.logger.info("nat_connection_established", peer_id=message.sender_id)
+        except Exception as e:
+            self.logger.warning("nat_connection_failed", peer_id=message.sender_id, error=str(e))
+    
+    async def _handle_nat_punch_request(self, message: Message, sender_address: str):
+        """Handle NAT punch request from a peer."""
+        if not self.nat_traversal:
+            return
+        
+        punch_id = message.payload.get("punch_id")
+        self.logger.info("received_punch_request", peer_id=message.sender_id, punch_id=punch_id)
+        
+        # The hole puncher will handle the actual punching when it receives UDP packets
     
     async def _heartbeat_loop(self):
         """Send periodic heartbeats to peers."""
@@ -513,3 +612,121 @@ class Node:
             stats["dht_stats"] = self.dht.get_statistics()
         
         return stats
+    
+    # NAT Traversal Methods
+    
+    async def get_nat_candidates(self) -> List[dict]:
+        """
+        Get NAT traversal candidates for establishing connections.
+        
+        Returns:
+            List of connection candidates
+        """
+        if not self.nat_traversal:
+            raise RuntimeError("NAT traversal not initialized")
+        
+        return await self.nat_traversal.get_candidates()
+    
+    async def request_peer_connection(self, peer_id: str):
+        """
+        Request a NAT-aware connection to a peer.
+        
+        This initiates the ICE-like candidate exchange process.
+        
+        Args:
+            peer_id: Target peer's node ID
+        """
+        if not self.nat_traversal:
+            raise RuntimeError("NAT traversal not initialized")
+        
+        # Get our candidates
+        candidates = await self.get_nat_candidates()
+        
+        # Send candidate offer to peer
+        offer = MessageFactory.create_nat_candidate_offer(
+            self.identity.node_id,
+            candidates
+        )
+        
+        await self.network.send_to_peer(peer_id, offer)
+        self.logger.info(f"Sent NAT candidate offer to {peer_id}")
+    
+    def is_behind_nat(self) -> bool:
+        """
+        Check if this node is behind NAT.
+        
+        Returns:
+            True if behind NAT
+        """
+        if not self.nat_traversal:
+            return False
+        
+        return self.nat_traversal.is_behind_nat()
+    
+    def get_nat_info(self) -> dict:
+        """
+        Get NAT information.
+        
+        Returns:
+            Dictionary with NAT type and addresses
+        """
+        if not self.nat_traversal:
+            return {}
+        
+        return self.nat_traversal.get_nat_info()
+    
+    async def _handle_nat_candidate_offer(self, message: Message, sender_address: str):
+        """Handle NAT candidate offer from a peer."""
+        sender_id = message.sender_id
+        candidates = message.payload.get("candidates", [])
+        
+        self.logger.info(f"Received NAT candidate offer from {sender_id}")
+        
+        # Get our candidates and send answer
+        our_candidates = await self.get_nat_candidates()
+        
+        answer = MessageFactory.create_nat_candidate_answer(
+            self.identity.node_id,
+            our_candidates
+        )
+        
+        await self.network.send_to_peer(sender_id, answer)
+        
+        # Attempt hole punching with their candidates
+        if self.nat_traversal:
+            try:
+                success = await self.nat_traversal.connect_to_peer(sender_id, candidates)
+                if success:
+                    self.logger.info(f"Successfully established NAT traversal connection to {sender_id}")
+                else:
+                    self.logger.warning(f"Failed to establish NAT traversal connection to {sender_id}")
+            except Exception as e:
+                self.logger.error(f"Error during NAT traversal to {sender_id}: {e}")
+    
+    async def _handle_nat_candidate_answer(self, message: Message, sender_address: str):
+        """Handle NAT candidate answer from a peer."""
+        sender_id = message.sender_id
+        candidates = message.payload.get("candidates", [])
+        
+        self.logger.info(f"Received NAT candidate answer from {sender_id}")
+        
+        # Attempt hole punching with their candidates
+        if self.nat_traversal:
+            try:
+                success = await self.nat_traversal.connect_to_peer(sender_id, candidates)
+                if success:
+                    self.logger.info(f"Successfully established NAT traversal connection to {sender_id}")
+                else:
+                    self.logger.warning(f"Failed to establish NAT traversal connection to {sender_id}")
+            except Exception as e:
+                self.logger.error(f"Error during NAT traversal to {sender_id}: {e}")
+    
+    async def _handle_nat_punch_request(self, message: Message, sender_address: str):
+        """Handle NAT punch request."""
+        punch_id = message.payload.get("punch_id")
+        sender_id = message.sender_id
+        
+        self.logger.debug(f"Received NAT punch request from {sender_id}, punch_id={punch_id}")
+        
+        # The punch request itself serves to open our NAT
+        # Connection attempt should already be in progress from candidate exchange

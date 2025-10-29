@@ -61,6 +61,7 @@ A production-ready decentralized peer-to-peer network implementation in Python w
 - **Bloom Filters**: Space-efficient probabilistic data structures for message deduplication with configurable false positive rates
 - **Distributed Hash Table (DHT)**: Kademlia-inspired distributed key-value storage with automatic replication and fault tolerance
 - **Enhanced Metrics**: Comprehensive monitoring with counters, gauges, histograms, and Prometheus export support
+- **NAT Traversal**: STUN-based NAT discovery and UDP hole punching for peer-to-peer connectivity through NATs and firewalls
 
 ## Architecture
 
@@ -334,6 +335,34 @@ prometheus_output = metrics.export_prometheus()
 print(prometheus_output)
 ```
 
+### NAT Traversal & Hole Punching ✨ NEW
+
+```python
+# Check if node is behind NAT
+if node.is_behind_nat():
+    print("Node is behind NAT")
+    nat_info = node.get_nat_info()
+    print(f"NAT Type: {nat_info['nat_type']}")
+    print(f"Public Address: {nat_info['public_address']}:{nat_info['public_port']}")
+
+# Get connection candidates for NAT traversal
+candidates = await node.get_nat_candidates()
+print(f"Available candidates: {len(candidates)}")
+for candidate in candidates:
+    print(f"  {candidate['type']}: {candidate['ip']}:{candidate['port']} (priority: {candidate['priority']})")
+
+# Request NAT-aware connection to a peer
+# This initiates ICE-like candidate exchange
+await node.request_peer_connection("peer_node_id")
+
+# The NAT traversal manager automatically:
+# 1. Discovers public endpoints using STUN
+# 2. Gathers host and server-reflexive candidates
+# 3. Exchanges candidates with the peer
+# 4. Attempts UDP hole punching
+# 5. Maintains NAT bindings with keep-alive packets
+```
+
 ## Testing
 
 ### Run All Tests
@@ -570,7 +599,7 @@ MIT License - See LICENSE file for details
 - [x] **Bloom filters for efficient anti-entropy** ✨ NEW
 - [x] **DHT implementation for distributed key-value storage** ✨ NEW
 - [x] **Enhanced metrics and monitoring dashboard** ✨ NEW
-- [ ] NAT traversal and hole punching
+- [x] **NAT traversal and hole punching** ✨ NEW
 - [ ] QUIC transport support
 - [ ] Rust extensions for performance-critical paths (C/C++/Cython support)
 - [ ] WebRTC support for browser nodes
