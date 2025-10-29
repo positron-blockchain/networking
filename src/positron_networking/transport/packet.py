@@ -36,6 +36,8 @@ class PacketFlags(IntEnum):
     FRAGMENTED = 0x10        # Part of fragmented message
     PRIORITY = 0x20          # High priority packet
     LAST_FRAGMENT = 0x40     # Last fragment in sequence
+    FIN = 0x80               # Connection close flag (compatibility)
+    RST = 0x100              # Reset connection flag (compatibility)
 
 
 @dataclass
@@ -61,7 +63,7 @@ class PacketHeader:
     
     MAGIC = 0xBEEF
     VERSION = 0x01
-    HEADER_SIZE = 32
+    HEADER_SIZE = 28  # Actual struct size
     
     packet_type: int
     flags: int = 0
@@ -74,24 +76,44 @@ class PacketHeader:
     fragment_offset: int = 0
     fragment_total: int = 0
     
+    # Compatibility properties for tests
+    @property
+    def sequence_number(self) -> int:
+        """Alias for sequence (compatibility)."""
+        return self.sequence
+    
+    @sequence_number.setter
+    def sequence_number(self, value: int):
+        """Alias for sequence (compatibility)."""
+        self.sequence = value
+    
+    @property
+    def fragment_index(self) -> int:
+        """Alias for fragment_offset (compatibility)."""
+        return self.fragment_offset
+    
+    @fragment_index.setter
+    def fragment_index(self, value: int):
+        """Alias for fragment_offset (compatibility)."""
+        self.fragment_offset = value
+    
     def to_bytes(self) -> bytes:
         """Serialize header to bytes."""
         return struct.pack(
-            '!HBBBBIHHIBIIIHH',  # Network byte order (big-endian)
-            self.MAGIC,           # Magic number
-            self.VERSION,         # Protocol version
-            self.packet_type,     # Packet type
-            self.flags,           # Flags
-            0,                    # Reserved
-            0,                    # Reserved padding
-            self.sequence,        # Sequence number
-            self.ack_number,      # Ack number
-            self.window_size,     # Window size
-            self.checksum,        # Checksum
-            self.payload_length,  # Payload length
-            self.fragment_id,     # Fragment ID
-            self.fragment_offset, # Fragment offset
-            self.fragment_total   # Fragment total
+            '!HBBBHIHHIBIHH',    # Network byte order (big-endian)
+            self.MAGIC,           # Magic number (H = 2 bytes)
+            self.VERSION,         # Protocol version (B = 1 byte)
+            self.packet_type,     # Packet type (B = 1 byte)
+            self.flags,           # Flags (B = 1 byte)
+            0,                    # Reserved (B = 1 byte) + padding (B = 1 byte) -> H = 2 bytes
+            self.sequence,        # Sequence number (I = 4 bytes)
+            self.ack_number,      # Ack number (I = 4 bytes)
+            self.window_size,     # Window size (H = 2 bytes)
+            self.checksum,        # Checksum (I = 4 bytes)
+            self.payload_length,  # Payload length (I = 4 bytes)
+            self.fragment_id,     # Fragment ID (I = 4 bytes)
+            self.fragment_offset, # Fragment offset (H = 2 bytes)
+            self.fragment_total   # Fragment total (H = 2 bytes)
         )
     
     @classmethod
@@ -101,9 +123,9 @@ class PacketHeader:
             return None
         
         try:
-            unpacked = struct.unpack('!HBBBBIHHIBIIIHH', data[:cls.HEADER_SIZE])
+            unpacked = struct.unpack('!HBBBHIHHIBIHH', data[:cls.HEADER_SIZE])
             
-            magic, version, pkt_type, flags, _, _, seq, ack, window, \
+            magic, version, pkt_type, flags, _, seq, ack, window, \
                 checksum, payload_len, frag_id, frag_offset, frag_total = unpacked
             
             # Validate magic number and version
@@ -197,7 +219,7 @@ class Packet:
         
         # Verify checksum
         if not packet.verify_checksum():
-            return None
+            raise ValueError("Packet checksum verification failed")
         
         return packet
     
@@ -253,6 +275,7 @@ class Packet:
         cls,
         sequence: int,
         payload: bytes,
+        ack_number: int = 0,
         reliable: bool = True,
         ordered: bool = False
     ) -> 'Packet':
@@ -266,7 +289,8 @@ class Packet:
         header = PacketHeader(
             packet_type=PacketType.DATA,
             flags=flags,
-            sequence=sequence
+            sequence=sequence,
+            ack_number=ack_number
         )
         return cls(header=header, payload=payload)
     
@@ -295,7 +319,7 @@ class Packet:
         """Create FIN packet for connection termination."""
         header = PacketHeader(
             packet_type=PacketType.FIN,
-            flags=PacketFlags.RELIABLE,
+            flags=PacketFlags.RELIABLE | PacketFlags.FIN,  # Add FIN flag
             sequence=sequence
         )
         return cls(header=header)
@@ -339,13 +363,13 @@ class PacketFragmenter:
         self.mtu = mtu
         self.reassembly_buffer: dict = {}  # fragment_id -> {offset -> fragment}
     
-    def fragment(self, payload: bytes, sequence: int, flags: int = 0) -> List[Packet]:
+    def fragment(self, payload: bytes, sequence: int = 0, flags: int = 0) -> List[Packet]:
         """
         Fragment large payload into multiple packets.
         
         Args:
             payload: Data to fragment
-            sequence: Starting sequence number
+            sequence: Starting sequence number (default: 0)
             flags: Packet flags
             
         Returns:
@@ -421,6 +445,18 @@ class PacketFragmenter:
             return payload
         
         return None
+    
+    def add_fragment(self, packet: Packet) -> Optional[bytes]:
+        """
+        Add a fragment and try to reassemble (compatibility alias).
+        
+        Args:
+            packet: Fragment packet
+            
+        Returns:
+            Complete payload if all fragments received, None otherwise
+        """
+        return self.reassemble(packet)
     
     def cleanup_stale(self, timeout: float = 30.0):
         """Remove stale reassembly buffers."""

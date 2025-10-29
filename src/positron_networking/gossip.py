@@ -223,17 +223,26 @@ class GossipProtocol:
             messages_to_send.append(self.pending_messages.popleft())
         
         # Send messages to selected peers
-        # Note: Actual sending would be done by the network transport layer
-        # This just prepares the gossip batch
         for peer in peers:
             for message in messages_to_send:
                 # Skip if peer is the original sender
                 if message.sender_id == peer.node_id:
                     continue
                 
-                # This would trigger the actual network send
-                # For now, we just track statistics
-                self.stats["messages_propagated"] += 1
+                # Send via network callback if available
+                if self.network_send_callback:
+                    try:
+                        await self.network_send_callback(peer.node_id, message)
+                        self.stats["messages_propagated"] += 1
+                    except Exception as e:
+                        self.logger.error(
+                            "gossip_send_failed",
+                            peer_id=peer.node_id,
+                            error=str(e)
+                        )
+                else:
+                    # Track statistics even if no callback
+                    self.stats["messages_propagated"] += 1
                 
                 # Yield to event loop
                 await asyncio.sleep(0)

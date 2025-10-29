@@ -91,8 +91,11 @@ class Connection:
         try:
             self.writer.close()
             await self.writer.wait_closed()
-        except Exception:
-            pass
+        except Exception as e:
+            # Log but don't raise - connection is closing anyway
+            import structlog
+            logger = structlog.get_logger()
+            logger.debug("connection_close_error", error=str(e), peer=self.peer_address)
     
     def __str__(self) -> str:
         return f"Connection({self.peer_address}, {self.peer_node_id})"
@@ -321,11 +324,14 @@ class NetworkTransport:
             
             connection.peer_node_id = handshake.sender_id
             
-            # Send handshake ack
+            # Send handshake ack with list of known peers
+            # Get list of connected peer IDs to share
+            peer_ids = list(self.connections.keys())[:10]  # Share up to 10 peers
+            
             ack = MessageFactory.create_handshake_ack(
                 self.identity.node_id,
                 self.identity.get_public_key_bytes(),
-                []  # Empty peer list for now
+                peer_ids
             )
             
             # Sign the ack

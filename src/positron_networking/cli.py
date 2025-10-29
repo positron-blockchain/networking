@@ -5,6 +5,7 @@ import asyncio
 import click
 import json
 from pathlib import Path
+from typing import Optional
 from rich.console import Console
 from rich.table import Table
 from rich.live import Live
@@ -104,23 +105,99 @@ async def _run_node(node: Node):
 @main.command()
 @click.option("--config", "-c", type=click.Path(), help="Path to configuration file")
 @click.option("--output", "-o", type=click.Path(), help="Output file for stats")
-def stats(config, output):
-    """Display node statistics."""
+@click.option("--data-dir", "-d", default="node_data", help="Data directory")
+def stats(config, output, data_dir):
+    """Display node statistics from storage."""
     
-    # This would connect to a running node via IPC or load from storage
-    # For now, we'll show a placeholder
+    asyncio.run(_display_stats(config, output, data_dir))
+
+
+async def _display_stats(config: Optional[str], output: Optional[str], data_dir: str):
+    """Fetch and display statistics from node storage."""
     
-    table = Table(title="Network Statistics")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="green")
+    # Load configuration to get data directory
+    if config and Path(config).exists():
+        net_config = NetworkConfig.from_file(config)
+    else:
+        net_config = NetworkConfig(data_dir=data_dir)
     
-    table.add_row("Status", "Running")
-    table.add_row("Active Peers", "0")
-    table.add_row("Known Peers", "0")
-    table.add_row("Messages Sent", "0")
-    table.add_row("Messages Received", "0")
-    
-    console.print(table)
+    try:
+        # Load storage to get persisted stats
+        from positron_networking.storage import Storage
+        
+        storage = Storage(net_config.db_path)
+        await storage.initialize()
+        
+        # Fetch stats from storage
+        peers = await storage.get_all_peers()
+        
+        # Get identity if available
+        identity = None
+        if Path(net_config.private_key_path).exists():
+            from positron_networking.identity import Identity
+            identity = Identity.load_or_generate(
+                net_config.private_key_path,
+                net_config.public_key_path
+            )
+        
+        # Create statistics table
+        table = Table(title="Network Statistics")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="green")
+        
+        if identity:
+            table.add_row("Node ID", identity.node_id[:16] + "...")
+        table.add_row("Data Directory", net_config.data_dir)
+        table.add_row("Known Peers", str(len(peers)))
+        table.add_row("Database Path", net_config.db_path)
+        
+        console.print(table)
+        
+        # Show peer list if available
+        if peers:
+            peer_table = Table(title="Known Peers")
+            peer_table.add_column("Node ID", style="cyan")
+            peer_table.add_column("Address", style="blue")
+            peer_table.add_column("Trust Score", style="green")
+            
+            for peer in peers[:10]:  # Show first 10
+                peer_table.add_row(
+                    peer.node_id[:16] + "...",
+                    peer.address,
+                    f"{peer.trust_score:.2f}"
+                )
+            
+            if len(peers) > 10:
+                console.print(f"\n[dim]Showing 10 of {len(peers)} peers[/dim]")
+            
+            console.print(peer_table)
+        
+        await storage.close()
+        
+        # Save to file if requested
+        if output:
+            stats_data = {
+                "node_id": identity.node_id if identity else None,
+                "data_dir": net_config.data_dir,
+                "known_peers": len(peers),
+                "peers": [
+                    {
+                        "node_id": p.node_id,
+                        "address": p.address,
+                        "trust_score": p.trust_score
+                    }
+                    for p in peers
+                ]
+            }
+            
+            with open(output, 'w') as f:
+                json.dump(stats_data, f, indent=2)
+            
+            console.print(f"\n[green]Statistics saved to {output}[/green]")
+            
+    except Exception as e:
+        console.print(f"[red]Error loading statistics: {e}[/red]")
+        console.print("[yellow]Note: Stats are loaded from storage. Start a node first to generate data.[/yellow]")
 
 
 @main.command()

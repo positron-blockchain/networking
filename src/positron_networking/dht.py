@@ -155,6 +155,7 @@ class DistributedHashTable:
         alpha: int = 3,
         replication_factor: int = 3,
         ttl_default: float = 3600.0,
+        network_send_callback: Optional[Any] = None,
     ):
         """
         Initialize DHT.
@@ -166,6 +167,7 @@ class DistributedHashTable:
             alpha: Concurrency parameter for parallel lookups
             replication_factor: Number of nodes to replicate data to
             ttl_default: Default time-to-live for stored values (seconds)
+            network_send_callback: Callback for sending network messages
         """
         self.node_id = node_id
         self.address = address
@@ -173,6 +175,7 @@ class DistributedHashTable:
         self.alpha = alpha
         self.replication_factor = replication_factor
         self.ttl_default = ttl_default
+        self.network_send_callback = network_send_callback
         
         self.logger = structlog.get_logger()
         
@@ -182,8 +185,11 @@ class DistributedHashTable:
         # Local storage
         self.storage: Dict[str, DHTValue] = {}
         
-        # Pending lookups
+        # Pending lookups (key_hash -> future)
         self.pending_lookups: Dict[str, asyncio.Future] = {}
+        
+        # Pending stores (correlation_id -> future)
+        self.pending_operations: Dict[str, asyncio.Future] = {}
         
         # Statistics
         self.stats = {
@@ -191,6 +197,9 @@ class DistributedHashTable:
             'retrievals': 0,
             'replications': 0,
             'expirations': 0,
+            'lookups': 0,
+            'network_stores': 0,
+            'network_lookups': 0,
         }
         
         # Background tasks
@@ -364,29 +373,145 @@ class DistributedHashTable:
         return deleted
     
     async def _replicate_value(self, key_hash: str, dht_value: DHTValue):
-        """Replicate a value to closest nodes."""
+        """
+        Replicate a value to closest nodes using network RPCs.
+        
+        Args:
+            key_hash: Hashed key
+            dht_value: Value to replicate
+        """
         closest = self.find_closest_nodes(key_hash, self.replication_factor)
         
-        # In a real implementation, this would send STORE RPCs to closest nodes
-        # For now, we just track the intended replicas
+        if not self.network_send_callback:
+            # No network available, just track local replicas
+            for node in closest:
+                dht_value.replicas.add(node.node_id)
+            self.stats['replications'] += 1
+            return
+        
+        # Send STORE RPCs to closest nodes
+        store_tasks = []
         for node in closest:
-            dht_value.replicas.add(node.node_id)
+            if node.node_id == self.node_id:
+                continue
+                
+            try:
+                # Create DHT_STORE message
+                message_payload = {
+                    'key': dht_value.key,
+                    'value': dht_value.value,
+                    'ttl': dht_value.ttl,
+                    'timestamp': dht_value.timestamp,
+                    'operation': 'store'
+                }
+                
+                task = self._send_dht_message(
+                    node.address,
+                    'DHT_STORE',
+                    message_payload
+                )
+                store_tasks.append(task)
+                dht_value.replicas.add(node.node_id)
+                
+                self.logger.debug(
+                    "replicating_value",
+                    key=dht_value.key,
+                    target_node=node.node_id,
+                    target_address=node.address
+                )
+                
+            except Exception as e:
+                self.logger.warning(
+                    "value_replication_failed",
+                    node_id=node.node_id,
+                    error=str(e)
+                )
+        
+        # Wait for all replication tasks
+        if store_tasks:
+            results = await asyncio.gather(*store_tasks, return_exceptions=True)
+            success_count = sum(1 for r in results if not isinstance(r, Exception))
+            
+            self.logger.info(
+                "value_replicated",
+                key=dht_value.key,
+                success_count=success_count,
+                total_attempts=len(store_tasks)
+            )
         
         self.stats['replications'] += 1
+        self.stats['network_stores'] += len(store_tasks)
     
     async def _replicate_delete(self, key_hash: str):
-        """Replicate a delete operation to closest nodes."""
+        """
+        Replicate a delete operation to closest nodes using network RPCs.
+        
+        Args:
+            key_hash: Hashed key to delete
+        """
         closest = self.find_closest_nodes(key_hash, self.replication_factor)
         
-        # In a real implementation, this would send DELETE RPCs
-        # This is a placeholder for integration with the network layer
-        pass
+        if not self.network_send_callback:
+            # No network available, log only
+            self.logger.debug(
+                "delete_replication_skipped_no_network",
+                key_hash=key_hash,
+                node_count=len(closest)
+            )
+            return
+        
+        # Send DELETE RPCs to replica nodes
+        delete_tasks = []
+        for node in closest:
+            if node.node_id == self.node_id:
+                continue
+                
+            try:
+                # Create DHT_DELETE message
+                message_payload = {
+                    'key_hash': key_hash,
+                    'operation': 'delete'
+                }
+                
+                task = self._send_dht_message(
+                    node.address,
+                    'DHT_DELETE',
+                    message_payload
+                )
+                delete_tasks.append(task)
+                
+                self.logger.debug(
+                    "replicating_delete",
+                    key_hash=key_hash,
+                    target_node=node.node_id,
+                    target_address=node.address
+                )
+                
+            except Exception as e:
+                self.logger.warning(
+                    "delete_replication_failed",
+                    node_id=node.node_id,
+                    error=str(e)
+                )
+        
+        # Wait for all deletion tasks
+        if delete_tasks:
+            results = await asyncio.gather(*delete_tasks, return_exceptions=True)
+            success_count = sum(1 for r in results if not isinstance(r, Exception))
+            
+            self.logger.info(
+                "delete_replicated",
+                key_hash=key_hash,
+                success_count=success_count,
+                total_attempts=len(delete_tasks)
+            )
     
     async def _lookup_value(self, key_hash: str) -> Optional[Any]:
         """
-        Perform iterative lookup for a value.
+        Perform iterative lookup for a value using network RPCs.
         
-        This would query progressively closer nodes until the value is found.
+        This performs an iterative node lookup to find the value,
+        querying progressively closer nodes until the value is found.
         
         Args:
             key_hash: Hashed key
@@ -394,9 +519,291 @@ class DistributedHashTable:
         Returns:
             Value if found, None otherwise
         """
-        # In a full implementation, this would perform iterative node lookup
-        # and query nodes for the value
-        # For now, this is a placeholder for integration with the network layer
+        if not self.network_send_callback:
+            # No network available - can only find local values
+            self.logger.debug("lookup_skipped_no_network", key_hash=key_hash)
+            return None
+        
+        # Track queried nodes to avoid loops
+        queried_nodes: Set[str] = set()
+        
+        # Get closest nodes we know about
+        closest_nodes = self.find_closest_nodes(key_hash, self.alpha)
+        
+        if not closest_nodes:
+            self.logger.debug("no_nodes_for_lookup", key_hash=key_hash)
+            return None
+        
+        # Iterative lookup process
+        max_iterations = 20  # Prevent infinite loops
+        iteration = 0
+        found_value = None
+        
+        while iteration < max_iterations and closest_nodes and found_value is None:
+            iteration += 1
+            
+            # Query the closest unqueried nodes in parallel
+            query_tasks = []
+            nodes_to_query = []
+            
+            for node in closest_nodes:
+                if node.node_id not in queried_nodes:
+                    nodes_to_query.append(node)
+                    queried_nodes.add(node.node_id)
+                    
+                    # Send FIND_VALUE RPC
+                    message_payload = {
+                        'key_hash': key_hash,
+                        'operation': 'find_value'
+                    }
+                    
+                    task = self._send_dht_message(
+                        node.address,
+                        'DHT_FIND_VALUE',
+                        message_payload
+                    )
+                    query_tasks.append((node, task))
+                    
+                    self.logger.debug(
+                        "querying_node_for_value",
+                        node_id=node.node_id,
+                        key_hash=key_hash,
+                        iteration=iteration
+                    )
+                    
+                if len(nodes_to_query) >= self.alpha:
+                    break
+            
+            if not query_tasks:
+                # No more nodes to query
+                break
+            
+            # Wait for responses
+            for node, task in query_tasks:
+                try:
+                    response = await asyncio.wait_for(task, timeout=5.0)
+                    
+                    if response and 'value' in response:
+                        # Found the value!
+                        found_value = response['value']
+                        self.logger.info(
+                            "value_found",
+                            key_hash=key_hash,
+                            found_at_node=node.node_id,
+                            iteration=iteration
+                        )
+                        break
+                    elif response and 'closer_nodes' in response:
+                        # Got closer nodes, add them to our search
+                        for node_data in response['closer_nodes']:
+                            new_node = DHTNode(
+                                node_id=node_data['node_id'],
+                                address=node_data['address']
+                            )
+                            if new_node.node_id not in queried_nodes:
+                                # Calculate distance and insert in sorted order
+                                dist = self._calculate_distance(new_node.node_id, key_hash)
+                                self.add_node(new_node.node_id, new_node.address)
+                                
+                except asyncio.TimeoutError:
+                    self.logger.debug(
+                        "lookup_timeout",
+                        node_id=node.node_id,
+                        key_hash=key_hash
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        "lookup_error",
+                        node_id=node.node_id,
+                        key_hash=key_hash,
+                        error=str(e)
+                    )
+            
+            if found_value is None:
+                # Update closest_nodes for next iteration
+                closest_nodes = self.find_closest_nodes(key_hash, self.alpha)
+                # Filter out already queried nodes
+                closest_nodes = [n for n in closest_nodes if n.node_id not in queried_nodes]
+        
+        self.stats['lookups'] += 1
+        self.stats['network_lookups'] += 1
+        
+        self.logger.debug(
+            "lookup_complete",
+            key_hash=key_hash,
+            iterations=iteration,
+            queried_count=len(queried_nodes),
+            found=found_value is not None
+        )
+        
+        return found_value
+    
+    async def _send_dht_message(self, target_address: str, message_type: str, payload: dict) -> Optional[dict]:
+        """
+        Send a DHT message to a target node.
+        
+        Args:
+            target_address: Target node address
+            message_type: Type of DHT message (DHT_STORE, DHT_FIND_VALUE, etc.)
+            payload: Message payload
+            
+        Returns:
+            Response payload if successful, None otherwise
+        """
+        if not self.network_send_callback:
+            return None
+        
+        try:
+            # Generate correlation ID for tracking responses
+            correlation_id = hashlib.sha256(
+                f"{target_address}{message_type}{time.time()}".encode()
+            ).hexdigest()[:16]
+            
+            # Create future for response
+            response_future = asyncio.Future()
+            self.pending_operations[correlation_id] = response_future
+            
+            # Add correlation ID to payload
+            payload['correlation_id'] = correlation_id
+            payload['sender_id'] = self.node_id
+            payload['sender_address'] = self.address
+            
+            # Send message via network callback
+            await self.network_send_callback(target_address, message_type, payload)
+            
+            # Wait for response with timeout
+            try:
+                response = await asyncio.wait_for(response_future, timeout=10.0)
+                return response
+            except asyncio.TimeoutError:
+                self.logger.debug(
+                    "dht_message_timeout",
+                    target=target_address,
+                    message_type=message_type
+                )
+                return None
+            finally:
+                # Clean up pending operation
+                self.pending_operations.pop(correlation_id, None)
+                
+        except Exception as e:
+            self.logger.error(
+                "dht_message_send_error",
+                target=target_address,
+                message_type=message_type,
+                error=str(e)
+            )
+            return None
+    
+    async def handle_dht_message(self, message_type: str, payload: dict) -> Optional[dict]:
+        """
+        Handle incoming DHT RPC messages.
+        
+        Args:
+            message_type: Type of DHT message
+            payload: Message payload
+            
+        Returns:
+            Response payload
+        """
+        sender_id = payload.get('sender_id')
+        sender_address = payload.get('sender_address')
+        correlation_id = payload.get('correlation_id')
+        
+        # Add sender to routing table
+        if sender_id and sender_address:
+            self.add_node(sender_id, sender_address)
+        
+        try:
+            if message_type == 'DHT_STORE':
+                # Handle STORE request
+                key = payload.get('key')
+                value = payload.get('value')
+                ttl = payload.get('ttl', self.ttl_default)
+                timestamp = payload.get('timestamp', time.time())
+                
+                dht_value = DHTValue(
+                    key=key,
+                    value=value,
+                    timestamp=timestamp,
+                    ttl=ttl,
+                    replicas={self.node_id, sender_id}
+                )
+                self.storage[key] = dht_value
+                
+                self.logger.debug("dht_store_received", key=key, from_node=sender_id)
+                
+                return {'status': 'success', 'correlation_id': correlation_id}
+            
+            elif message_type == 'DHT_FIND_VALUE':
+                # Handle FIND_VALUE request
+                key_hash = payload.get('key_hash')
+                
+                # Check if we have the value locally
+                for key, dht_value in self.storage.items():
+                    if self._hash_key(key) == key_hash and not dht_value.is_expired():
+                        self.logger.debug("dht_value_found_locally", key_hash=key_hash)
+                        return {
+                            'value': dht_value.value,
+                            'correlation_id': correlation_id
+                        }
+                
+                # Value not found, return closer nodes
+                closer_nodes = self.find_closest_nodes(key_hash, self.k)
+                nodes_data = [
+                    {'node_id': n.node_id, 'address': n.address}
+                    for n in closer_nodes
+                ]
+                
+                self.logger.debug(
+                    "dht_returning_closer_nodes",
+                    key_hash=key_hash,
+                    node_count=len(nodes_data)
+                )
+                
+                return {
+                    'closer_nodes': nodes_data,
+                    'correlation_id': correlation_id
+                }
+            
+            elif message_type == 'DHT_DELETE':
+                # Handle DELETE request
+                key_hash = payload.get('key_hash')
+                
+                # Find and delete matching keys
+                keys_to_delete = []
+                for key in self.storage:
+                    if self._hash_key(key) == key_hash:
+                        keys_to_delete.append(key)
+                
+                for key in keys_to_delete:
+                    del self.storage[key]
+                
+                self.logger.debug(
+                    "dht_delete_received",
+                    key_hash=key_hash,
+                    deleted_count=len(keys_to_delete)
+                )
+                
+                return {'status': 'success', 'correlation_id': correlation_id}
+            
+            elif message_type in ['DHT_STORE_RESPONSE', 'DHT_FIND_VALUE_RESPONSE', 'DHT_DELETE_RESPONSE']:
+                # Handle responses to our requests
+                if correlation_id and correlation_id in self.pending_operations:
+                    future = self.pending_operations[correlation_id]
+                    if not future.done():
+                        future.set_result(payload)
+                
+                return None
+            
+        except Exception as e:
+            self.logger.error(
+                "dht_message_handling_error",
+                message_type=message_type,
+                error=str(e)
+            )
+            return {'status': 'error', 'error': str(e), 'correlation_id': correlation_id}
+        
         return None
     
     async def start(self):

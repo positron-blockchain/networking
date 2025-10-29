@@ -114,14 +114,14 @@ class Node:
         self._register_handlers()
         await self.gossip.start()
         
-        # Initialize DHT
+        # Initialize DHT (Distributed Hash Table) if enabled
         self.dht = DistributedHashTable(
             node_id=self.identity.node_id,
             address=self.address,
-            k=20,  # Standard Kademlia bucket size
-            alpha=3,  # Concurrency parameter
+            k=self.config.dht_k if hasattr(self.config, 'dht_k') else 20,
             replication_factor=self.config.dht_replication_factor if hasattr(self.config, 'dht_replication_factor') else 3,
-            ttl_default=self.config.dht_ttl_default if hasattr(self.config, 'dht_ttl_default') else 3600.0
+            ttl_default=self.config.dht_ttl_default if hasattr(self.config, 'dht_ttl_default') else 3600.0,
+            network_send_callback=self._send_dht_network_message
         )
         await self.dht.start()
         
@@ -251,6 +251,31 @@ class Node:
         self.gossip.register_handler(
             MessageType.CUSTOM_DATA,
             self._handle_custom_data
+        )
+        # Register DHT message handlers
+        self.gossip.register_handler(
+            MessageType.DHT_STORE,
+            self._handle_dht_message
+        )
+        self.gossip.register_handler(
+            MessageType.DHT_FIND_VALUE,
+            self._handle_dht_message
+        )
+        self.gossip.register_handler(
+            MessageType.DHT_DELETE,
+            self._handle_dht_message
+        )
+        self.gossip.register_handler(
+            MessageType.DHT_STORE_RESPONSE,
+            self._handle_dht_message
+        )
+        self.gossip.register_handler(
+            MessageType.DHT_FIND_VALUE_RESPONSE,
+            self._handle_dht_message
+        )
+        self.gossip.register_handler(
+            MessageType.DHT_DELETE_RESPONSE,
+            self._handle_dht_message
         )
     
     async def _handle_network_message(self, message: Message, sender_address: str):
@@ -675,58 +700,124 @@ class Node:
         
         return self.nat_traversal.get_nat_info()
     
-    async def _handle_nat_candidate_offer(self, message: Message, sender_address: str):
-        """Handle NAT candidate offer from a peer."""
-        sender_id = message.sender_id
-        candidates = message.payload.get("candidates", [])
+    async def _handle_dht_message(self, message: Message, sender_address: str):
+        """Handle DHT-related messages."""
+        message_type_name = MessageType(message.msg_type).name
         
-        self.logger.info(f"Received NAT candidate offer from {sender_id}")
-        
-        # Get our candidates and send answer
-        our_candidates = await self.get_nat_candidates()
-        
-        answer = MessageFactory.create_nat_candidate_answer(
-            self.identity.node_id,
-            our_candidates
+        self.logger.debug(
+            "dht_message_received",
+            message_type=message_type_name,
+            sender=message.sender_id
         )
         
-        await self.network.send_to_peer(sender_id, answer)
-        
-        # Attempt hole punching with their candidates
-        if self.nat_traversal:
-            try:
-                success = await self.nat_traversal.connect_to_peer(sender_id, candidates)
-                if success:
-                    self.logger.info(f"Successfully established NAT traversal connection to {sender_id}")
-                else:
-                    self.logger.warning(f"Failed to establish NAT traversal connection to {sender_id}")
-            except Exception as e:
-                self.logger.error(f"Error during NAT traversal to {sender_id}: {e}")
+        try:
+            # Forward to DHT handler
+            response = await self.dht.handle_dht_message(message_type_name, message.payload)
+            
+            # Send response if there is one
+            if response and message.sender_id:
+                # Determine response message type
+                response_type_map = {
+                    'DHT_STORE': MessageType.DHT_STORE_RESPONSE,
+                    'DHT_FIND_VALUE': MessageType.DHT_FIND_VALUE_RESPONSE,
+                    'DHT_DELETE': MessageType.DHT_DELETE_RESPONSE,
+                }
+                
+                response_type = response_type_map.get(message_type_name)
+                if response_type:
+                    response_message = MessageFactory.create_custom_message(
+                        self.identity.node_id,
+                        response_type,
+                        response
+                    )
+                    await self.network.send_to_peer(message.sender_id, response_message)
+                    
+        except Exception as e:
+            self.logger.error(
+                "dht_message_handling_error",
+                message_type=message_type_name,
+                error=str(e)
+            )
     
-    async def _handle_nat_candidate_answer(self, message: Message, sender_address: str):
-        """Handle NAT candidate answer from a peer."""
-        sender_id = message.sender_id
-        candidates = message.payload.get("candidates", [])
+    async def _send_dht_network_message(self, target_address: str, message_type: str, payload: dict):
+        """
+        Network callback for DHT to send messages.
         
-        self.logger.info(f"Received NAT candidate answer from {sender_id}")
-        
-        # Attempt hole punching with their candidates
-        if self.nat_traversal:
-            try:
-                success = await self.nat_traversal.connect_to_peer(sender_id, candidates)
-                if success:
-                    self.logger.info(f"Successfully established NAT traversal connection to {sender_id}")
-                else:
-                    self.logger.warning(f"Failed to establish NAT traversal connection to {sender_id}")
-            except Exception as e:
-                self.logger.error(f"Error during NAT traversal to {sender_id}: {e}")
-    
-    async def _handle_nat_punch_request(self, message: Message, sender_address: str):
-        """Handle NAT punch request."""
-        punch_id = message.payload.get("punch_id")
-        sender_id = message.sender_id
-        
-        self.logger.debug(f"Received NAT punch request from {sender_id}, punch_id={punch_id}")
-        
-        # The punch request itself serves to open our NAT
-        # Connection attempt should already be in progress from candidate exchange
+        Args:
+            target_address: Target node address
+            message_type: Type of DHT message
+            payload: Message payload
+        """
+        try:
+            # Convert message type string to MessageType enum
+            msg_type = MessageType[message_type]
+            
+            # Create message
+            message = MessageFactory.create_custom_message(
+                self.identity.node_id,
+                msg_type,
+                payload
+            )
+            
+            # Send to target
+            # Look up node_id from address in peer manager
+            target_node_id = None
+            for node_id, peer in self.peer_manager.known_peers.items():
+                if peer.address == target_address:
+                    target_node_id = node_id
+                    break
+            
+            if target_node_id:
+                await self.network.send_to_peer(target_node_id, message)
+            else:
+                # Address not in known peers - likely from DHT discovery
+                # Attempt to connect and establish the peer first
+                self.logger.info(
+                    "dht_connecting_to_new_peer",
+                    target_address=target_address,
+                    message_type=message_type
+                )
+                
+                try:
+                    # Attempt to establish connection
+                    connection = await self.network.connect(target_address)
+                    
+                    if connection:
+                        # Extract node_id from the connection/handshake
+                        # and retry the send
+                        await asyncio.sleep(0.1)  # Brief delay for handshake completion
+                        
+                        # Re-check peer manager after connection
+                        for node_id, peer in self.peer_manager.known_peers.items():
+                            if peer.address == target_address:
+                                await self.network.send_to_peer(node_id, message)
+                                self.logger.info(
+                                    "dht_message_sent_to_new_peer",
+                                    target_address=target_address,
+                                    node_id=node_id
+                                )
+                                return
+                        
+                        self.logger.warning(
+                            "dht_peer_not_registered_after_connection",
+                            target_address=target_address
+                        )
+                    else:
+                        self.logger.warning(
+                            "dht_connection_failed",
+                            target_address=target_address
+                        )
+                except Exception as conn_error:
+                    self.logger.error(
+                        "dht_connection_error",
+                        target_address=target_address,
+                        error=str(conn_error)
+                    )
+                
+        except Exception as e:
+            self.logger.error(
+                "dht_network_send_error",
+                target_address=target_address,
+                message_type=message_type,
+                error=str(e)
+            )
